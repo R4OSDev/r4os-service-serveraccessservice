@@ -1,0 +1,21 @@
+R4SRV - gemeinsamer R4OS-Serverzugang
+=====================================
+
+Service-Name: R4SRV. Die SDK-Fassade r4os.server_access sendet eine
+EnsureRequest fuer AppCenter, Updates oder Benchmarks. Der Dienst liest das
+Ziel bei jeder Anfrage erneut aus SYSTEM\Network\R4OSServer\<Komponente>.
+Die Registrierungsverbindung geht zur dortigen ServerIP auf Port 4021; der
+Datendienst-Port der Antwort stammt vom selben Registry-Ziel.
+
+PUBLIC verwendet vor dem Secret eine vollstaendig gepruefte TLS-Verbindung
+mit CA, UTC und IP-SAN. LAN verwendet den ausdruecklich gewaehlten TCP-Pfad.
+Geheimwerte werden nur aus C:\R4OS\SECRETS\R4OSSERVER.R4S geladen und nicht
+im Dienstzustand gespeichert. Ein fehlendes Secret ist ein Fehler.
+
+Der Dienst merkt Erfolg nach Profil, Ziel-IP und Netzkonfiguration. Ein
+Netzwerk- oder Profilwechsel verwirft die Freigaben im Speicher. Nach einem
+definitiven registration_required fuer einen idempotenten Leseaufruf darf
+der Konsument genau einmal bedingt mit der zuletzt gesehenen Generation
+neu anmelden. 403, 429 und ungewisse PUTs duerfen keinen solchen Versuch
+ausloesen. App Center darf sein Ziel speichern, soll aber bis zum verfuegbaren
+Serverdienst keine Datenverbindung aufbauen.

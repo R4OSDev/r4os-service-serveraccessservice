@@ -1,0 +1,3 @@
+R4SRV.R4X wurde fuer R4OS 0.89.X als eigenstaendiger Service neu angelegt.
+Fachliche Wahrheit: dieses Repository und sein module.R4MF.
+Keine fremden Quellkopien.
