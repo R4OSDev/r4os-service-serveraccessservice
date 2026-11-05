@@ -1,8 +1,9 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const access = r4os.server_access;
+const bootstrap = @import("bootstrap.zig");
 
-const timeout_ns: u64 = 10_000_000_000;
+const timeout_ns: u64 = 5_000_000_000;
 
 const NetworkPath = struct {
     local_ip: [4]u8,
@@ -18,6 +19,13 @@ const Entry = struct {
     generation: u32 = 0,
 };
 
+const Failed = struct {
+    profile: r4os.server_profile.Profile,
+    ip: [4]u8,
+    response: access.EnsureResponse,
+    retry_at: u64,
+};
+
 const Runtime = struct {
     app: ?*r4os.App = null,
     last_path: ?NetworkPath = null,
@@ -25,11 +33,36 @@ const Runtime = struct {
     entries: [3]Entry = .{Entry{}} ** 3,
     next_slot: usize = 0,
     generation: u32 = 0,
+    failures: [3]?Failed = .{null} ** 3,
+    next_failure: usize = 0,
     scratch: [r4os.app_web.tls_scratch_bytes]u8 = undefined,
 
     fn clear(self: *Runtime) void {
         self.entries = .{Entry{}} ** 3;
         self.next_slot = 0;
+        self.failures = .{null} ** 3;
+        self.next_failure = 0;
+    }
+
+    fn recentFailure(self: *Runtime, profile: r4os.server_profile.Profile, ip: [4]u8, port: u16, now: u64) ?access.EnsureResponse {
+        for (&self.failures) |*slot| if (slot.*) |failure| {
+            if (now >= failure.retry_at) {
+                slot.* = null;
+                continue;
+            }
+            if (failure.profile == profile and std.mem.eql(u8, &failure.ip, &ip)) {
+                var response = failure.response;
+                response.attempted = 0;
+                response.port = port;
+                return response;
+            }
+        };
+        return null;
+    }
+
+    fn rememberFailure(self: *Runtime, profile: r4os.server_profile.Profile, ip: [4]u8, response: access.EnsureResponse, retry_at: u64) void {
+        self.failures[self.next_failure] = .{ .profile = profile, .ip = ip, .response = response, .retry_at = retry_at };
+        self.next_failure = (self.next_failure + 1) % self.failures.len;
     }
 
     fn nextGeneration(self: *Runtime) u32 {
@@ -141,7 +174,10 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
 
     var network_config: r4os.abi.NetConfigSnapshot = .{};
     if (app.lowLevel().netConfigGet(&network_config) < 0 or
-        std.mem.eql(u8, &network_config.local_ip, &.{ 0, 0, 0, 0 })) {
+        std.mem.eql(u8, &network_config.local_ip, &.{ 0, 0, 0, 0 }))
+    {
+        state.clear();
+        state.last_path = null;
         response.code = @intFromEnum(access.Code.network);
         return response;
     }
@@ -152,7 +188,8 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
         .adapter_name = network_config.adapter_name,
     };
     if (state.last_profile == null or state.last_profile.? != profile or
-        state.last_path == null or !std.meta.eql(state.last_path.?, path)) {
+        state.last_path == null or !std.meta.eql(state.last_path.?, path))
+    {
         state.clear();
         state.last_profile = profile;
         state.last_path = path;
@@ -167,9 +204,18 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
         entry.valid = false;
     }
 
-    var secret = r4os.server_credentials.load(&ctx, .registration) catch {
-        response.code = @intFromEnum(access.Code.credentials);
-        return response;
+    if (state.recentFailure(profile, target.ip.octets, target.port, ctx.ticks())) |failed| return failed;
+    defer if (response.code != @intFromEnum(access.Code.ok) and response.attempted == 1) {
+        state.rememberFailure(profile, target.ip.octets, response, ctx.ticks() +| ctx.monotonicHz() *| 5);
+    };
+    var secret = switch (bootstrap.load(app, &state.scratch, profile, target, component)) {
+        .secret => |value| value,
+        .failure => |failed| {
+            response.code = failed.code;
+            response.detail = failed.detail;
+            response.attempted = failed.attempted;
+            return response;
+        },
     };
     defer secret.clear();
     var web = app.web() orelse {
@@ -197,4 +243,26 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
         },
     }
     return response;
+}
+
+test "registration generations and failed single flight expire or clear on path changes" {
+    std.testing.refAllDecls(bootstrap);
+    var state: Runtime = .{};
+    const ip = [4]u8{ 138, 201, 253, 143 };
+    const first = state.remember(.public, ip);
+    try std.testing.expect(first != 0);
+    try std.testing.expectEqual(first, state.find(.public, ip).?.generation);
+    try std.testing.expect(state.find(.lan, ip) == null);
+    const response: access.EnsureResponse = .{ .code = @intFromEnum(access.Code.bootstrap), .detail = 429, .attempted = 1, .profile = @intFromEnum(r4os.server_profile.Profile.public), .target_ip = ip, .port = 4022 };
+    state.rememberFailure(.public, ip, response, 50);
+    try std.testing.expect(state.recentFailure(.lan, ip, 4022, 40) == null);
+    try std.testing.expectEqual(@as(u8, 0), state.recentFailure(.public, ip, 4022, 49).?.attempted);
+    try std.testing.expectEqual(@as(u16, 429), state.recentFailure(.public, ip, 4022, 49).?.detail);
+    try std.testing.expect(state.recentFailure(.public, ip, 4022, 50) == null);
+    state.rememberFailure(.public, ip, response, 100);
+    try std.testing.expectEqual(@as(u16, 4023), state.recentFailure(.public, ip, 4023, 51).?.port);
+    state.clear();
+    try std.testing.expect(state.find(.public, ip) == null);
+    try std.testing.expect(state.recentFailure(.public, ip, 4022, 51) == null);
+    try std.testing.expect(state.remember(.public, ip) != first);
 }
