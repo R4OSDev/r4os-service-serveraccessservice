@@ -9,8 +9,15 @@ Datendienst-Port der Antwort stammt vom selben Registry-Ziel.
 
 PUBLIC verwendet vor dem Secret eine vollstaendig gepruefte TLS-Verbindung
 mit CA, UTC und IP-SAN. LAN verwendet den ausdruecklich gewaehlten TCP-Pfad.
-Geheimwerte werden nur aus C:\R4OS\SECRETS\R4OSSERVER.R4S geladen und nicht
-im Dienstzustand gespeichert. Ein fehlendes Secret ist ein Fehler.
+Eine Betreiberdatei unter C:\R4OS\SECRETS\R4OSSERVER.R4S hat Vorrang. Auf
+offiziellen PUBLIC-Zielen kann der Erstzugang das installationsbezogene
+Lesesecret ueber geprueftes HTTPS anfordern und als PUBLIC.R4S anlegen.
+LAN und abweichende Ziele brauchen die Betreiberdatei. Der Dienst leert
+Secret- und TLS-Arbeitspuffer nach dem Austausch.
+
+Ab0.1.2 verwendet R4SRV Start2 und den TCP-Familienvertrag. Erstzugang
+und Registrierung teilen ein Gesamtbudget. Die Registrierung erwartet
+beide Bytes der OK-Antwort und verarbeitet geteilte TCP- oder TLS-Daten.
 
 Der Dienst merkt Erfolg nach Profil, Ziel-IP und Netzkonfiguration. Ein
 Netzwerk- oder Profilwechsel verwirft die Freigaben im Speicher. Nach einem

@@ -4,6 +4,7 @@ const access = r4os.server_access;
 const bootstrap = @import("bootstrap.zig");
 
 const timeout_ns: u64 = 5_000_000_000;
+const ensure_timeout = r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(2 * timeout_ns));
 
 const NetworkPath = struct {
     local_ip: [4]u8,
@@ -27,7 +28,6 @@ const Failed = struct {
 };
 
 const Runtime = struct {
-    app: ?*r4os.App = null,
     last_path: ?NetworkPath = null,
     last_profile: ?r4os.server_profile.Profile = null,
     entries: [3]Entry = .{Entry{}} ** 3,
@@ -98,10 +98,10 @@ const Runtime = struct {
 
 var runtime: Runtime = .{};
 
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const ctx = app.system();
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
-    runtime = .{ .app = app };
+    runtime = .{};
     var endpoint = switch (services.register(access.service_name, 0)) {
         .endpoint => |value| value,
         .failure => |raw| return raw,
@@ -111,7 +111,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     while (true) {
         switch (loop.wait(null)) {
             .requests => |pending| {
-                const result = loop.drain(pending, handleRequest, .{ &ctx, &endpoint });
+                const result = loop.drain(pending, handleRequest, .{ app, &endpoint });
                 if (result >= 0) continue;
                 _ = endpoint.unregister();
                 return result;
@@ -130,7 +130,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     return 0;
 }
 
-fn handleRequest(_: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint) i32 {
+fn handleRequest(app: *const r4os.App2, endpoint: *r4os.ServiceEndpoint) i32 {
     var payload: [r4os.abi.service_api_max_payload]u8 = undefined;
     const message = switch (endpoint.recv(payload[0..])) {
         .message => |value| value,
@@ -144,12 +144,12 @@ fn handleRequest(_: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint) 
     if (message.bytes == @sizeOf(access.EnsureRequest)) {
         var request: access.EnsureRequest = .{};
         @memcpy(std.mem.asBytes(&request), payload[0..message.bytes]);
-        response = ensure(&runtime, request);
+        response = ensure(app, &runtime, request);
     }
     return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
 }
 
-fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse {
+fn ensure(app: *const r4os.App2, state: *Runtime, request: access.EnsureRequest) access.EnsureResponse {
     var response: access.EnsureResponse = .{};
     if (request.reserved != 0 or request.force > 1) return response;
     const component: r4os.server_targets.Component = switch (request.component) {
@@ -158,7 +158,6 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
         2 => .benchmarks,
         else => return response,
     };
-    const app = state.app orelse return response;
     const ctx = app.system();
     const profile = r4os.server_profile.load(&ctx) catch {
         response.code = @intFromEnum(access.Code.profile);
@@ -208,7 +207,15 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
     defer if (response.code != @intFromEnum(access.Code.ok) and response.attempted == 1) {
         state.rememberFailure(profile, target.ip.octets, response, ctx.ticks() +| ctx.monotonicHz() *| 5);
     };
-    var secret = switch (bootstrap.load(app, &state.scratch, profile, target, component)) {
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(&app.context) catch {
+        response.code = @intFromEnum(access.Code.transport_unavailable);
+        return response;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, ensure_timeout) catch {
+        response.code = @intFromEnum(access.Code.transport_unavailable);
+        return response;
+    };
+    var secret = switch (bootstrap.load(app, &state.scratch, profile, target, component, &budget)) {
         .secret => |value| value,
         .failure => |failed| {
             response.code = failed.code;
@@ -229,7 +236,12 @@ fn ensure(state: *Runtime, request: access.EnsureRequest) access.EnsureResponse 
         .port = r4os.server_targets.registration_port,
         .tls = profile.registrationUsesTls(),
     };
-    const timeout = r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(timeout_ns));
+    var timeout = r4os.rpc_budget.remainingTimeout(&budget) catch {
+        response.code = @intFromEnum(access.Code.transport);
+        response.detail = @intFromEnum(r4os.app_web.Error.connect_timeout);
+        return response;
+    };
+    timeout.nanoseconds = @min(timeout.nanoseconds, timeout_ns);
     switch (web.registerServer(endpoint, secret.bytes(), &state.scratch, timeout)) {
         .accepted => {
             response.code = @intFromEnum(access.Code.ok);

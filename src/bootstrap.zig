@@ -5,7 +5,7 @@ const credentials = r.server_credentials;
 const empty_body_headers = "content-length:0\n";
 pub const Result = union(enum) { secret: credentials.Secret, failure: r.server_access.EnsureResponse };
 
-pub fn load(app: *r.App, scratch: []u8, profile: r.server_profile.Profile, target: r.server_targets.Target, component: r.server_targets.Component) Result {
+pub fn load(app: *const r.App2, scratch: []u8, profile: r.server_profile.Profile, target: r.server_targets.Target, component: r.server_targets.Component, budget: *r.rpc_budget.Budget) Result {
     const ctx = app.system();
     var failure: r.server_access.EnsureResponse = .{ .code = @intFromEnum(r.server_access.Code.credentials) };
     // An explicit operator file wins; malformed data is never silently replaced.
@@ -25,11 +25,15 @@ pub fn load(app: *r.App, scratch: []u8, profile: r.server_profile.Profile, targe
     defer std.crypto.secureZero(u8, &raw);
     defer std.crypto.secureZero(u8, &body);
     defer std.crypto.secureZero(u8, scratch);
+    var timeout = r.rpc_budget.remainingTimeout(budget) catch return .{ .failure = failure };
+    timeout.nanoseconds = @min(timeout.nanoseconds, 5_000_000_000);
     const result = web.fetch(credentials.bootstrap_url, &raw, &body, scratch, .{
         .method = .post,
         // The bootstrap contract requires a declared empty body.
         .headers = empty_body_headers,
-        .timeout = r.time_contract.timeoutFinite(r.time_contract.durationFromNanoseconds(5_000_000_000)),
+        .timeout = timeout,
+        .progress = ownerRunning,
+        .progress_context = @constCast(&ctx),
         .redirect = .error_mode,
         .redirect_limit = 0,
     });
@@ -60,6 +64,11 @@ pub fn load(app: *r.App, scratch: []u8, profile: r.server_profile.Profile, targe
         return .{ .failure = failure };
     };
     return .{ .secret = secret };
+}
+
+fn ownerRunning(raw: ?*anyopaque) callconv(.c) bool {
+    const sys: *const r.r4sys.Context = @ptrCast(@alignCast(raw orelse return false));
+    return !sys.programShouldClose();
 }
 
 test "bootstrap serializes one explicit empty POST length" {
